@@ -1,0 +1,169 @@
+// Cloudflare Worker — HLS proxy with manifest rewriting + CORS + redirects
+
+export default {
+  async fetch(request, env, ctx) {
+    const url = new URL(request.url);
+
+    // CORS preflight
+    if (request.method === "OPTIONS") {
+      return new Response(null, { headers: corsHeaders() });
+    }
+
+    // Simple health
+    if (url.pathname === "/health") {
+      return new Response("ok", { headers: corsHeaders() });
+    }
+
+    // Test player
+    if (url.pathname === "/player") {
+      const src = url.searchParams.get("src") || "/hls/live/playlist.m3u8";
+      return new Response(`<!doctype html>
+<html><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>HLS Player</title>
+<script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script>
+<style>html,body{margin:0;background:#000} video{width:100vw;height:100vh;object-fit:contain}</style>
+</head><body>
+<video id="v" controls muted playsinline></video>
+<script>
+const v=document.getElementById('v'); const src=${JSON.stringify(src)};
+if (window.Hls && Hls.isSupported()) { const h=new Hls(); h.loadSource(src); h.attachMedia(v); }
+else { v.src=src; }
+</script>
+</body></html>`, { headers: { "content-type": "text/html; charset=utf-8", ...corsHeaders() }});
+    }
+
+    // Diagnostics
+    if (url.pathname === "/diag") {
+      const p = url.searchParams.get("path") || "/hls/live/playlist.m3u8";
+      const up = await fetchUpstream(absOrigin(env) + p, request);
+      const raw = await up.text();
+      const rewritten = rewriteManifest(raw, up.url);
+      const head = s => s.split("\n").slice(0, 40).join("\n");
+      return new Response(
+        `=== UPSTREAM (${up.url}) ===\n${head(raw)}\n\n=== REWRITTEN (/hls) ===\n${head(rewritten)}\n`,
+        { headers: { "content-type": "text/plain; charset=utf-8", ...corsHeaders() } }
+      );
+    }
+
+    // Main HLS proxy
+    if (url.pathname.startsWith("/hls/")) {
+      return handleHls(request, env);
+    }
+
+    // default
+    return new Response("worker up", { headers: corsHeaders() });
+  }
+};
+
+function absOrigin(env) {
+  // غيّر هذا المتغير من إعدادات الـWorker إن رغبت: ORIGIN_BASE = http://46.152.116.98
+  return (env && env.ORIGIN_BASE) || "http://46.152.116.98";
+}
+
+function corsHeaders() {
+  return {
+    "Access-Control-Allow-Origin": "*",
+    "Access-Control-Allow-Headers": "*",
+    "Access-Control-Allow-Methods": "GET,HEAD,OPTIONS",
+  };
+}
+
+async function handleHls(request, env) {
+  const reqUrl = new URL(request.url);
+  const upstreamURL = new URL(absOrigin(env) + reqUrl.pathname + reqUrl.search);
+
+  const up = await fetchUpstream(upstreamURL.toString(), request);
+  const status = up.status;
+
+  // أنواع الملفات
+  const isM3U8 = /\.m3u8(\?.*)?$/i.test(reqUrl.pathname);
+  const isSegment = /\.(ts|m4s|mp4)(\?.*)?$/i.test(reqUrl.pathname);
+  const isKey = /\.key(\?.*)?$/i.test(reqUrl.pathname);
+
+  if (isM3U8) {
+    const raw = await up.text();
+    const rewritten = rewriteManifest(raw, up.url);
+    const h = new Headers(corsHeaders());
+    h.set("Content-Type", "application/vnd.apple.mpegurl");
+    h.set("Cache-Control", "no-store, must-revalidate");
+    return new Response(rewritten, { status: 200, headers: h });
+  }
+
+  // تمرير ستريم المقاطع كما هي
+  const h = new Headers(corsHeaders());
+  const pass = ["accept-ranges", "content-range", "content-type", "content-length", "cache-control"];
+  for (const k of pass) {
+    const v = up.headers.get(k);
+    if (v) h.set(k, v);
+  }
+  if (isSegment) {
+    if (!h.has("Content-Type")) h.set("Content-Type", "video/mp2t");
+    if (!h.has("Cache-Control")) h.set("Cache-Control", "public, max-age=15, immutable");
+  } else if (isKey) {
+    h.set("Content-Type", "application/octet-stream");
+    h.set("Cache-Control", "no-store");
+  }
+
+  // إن كان الأصل يُرجع خطأ، أعِد نفس الكود (بدون HTML)
+  if (status >= 400) {
+    return new Response(`Upstream error ${status}`, { status, headers: { "content-type": "text/plain", ...corsHeaders() }});
+  }
+
+  return new Response(up.body, { status, headers: h });
+}
+
+async function fetchUpstream(url, request) {
+  // نتبع التحويلات ونطلب المحتوى غير مضغوط
+  const headers = new Headers({
+    "Accept": "*/*",
+    "Accept-Encoding": "identity",
+    "User-Agent": request.headers.get("user-agent") || "Mozilla/5.0",
+    "Connection": "keep-alive",
+  });
+  const r = request.headers.get("range");
+  if (r) headers.set("Range", r);
+
+  // Cloudflare تتبع redirect افتراضيًا، نثبّته هنا
+  const init = { method: "GET", headers, redirect: "follow" };
+  const up = await fetch(url, init);
+  return up;
+}
+
+// ==== إعادة كتابة الـmanifest ====
+function toWorkerPath(ref, baseAbsUrl) {
+  try {
+    const abs = new URL(ref, baseAbsUrl); // يحل النسبي أيضًا
+    let p = abs.pathname.replace(/^\/hls/i, ""); // تجنّب /hls/hls
+    return `/hls${p}${abs.search || ""}`;
+  } catch {
+    if (typeof ref === "string" && ref.startsWith("/")) {
+      const p = ref.replace(/^\/hls/i, "");
+      return `/hls${p}`;
+    }
+    return ref;
+  }
+}
+
+function rewriteManifest(text, baseAbsUrl) {
+  const TAGS = [
+    "EXT-X-KEY",
+    "EXT-X-SESSION-KEY",
+    "EXT-X-MAP",
+    "EXT-X-MEDIA",
+    "EXT-X-I-FRAME-STREAM-INF",
+    "EXT-X-SESSION-DATA",
+  ];
+  const TAGS_RE = new RegExp(`^#(?:${TAGS.join("|")}):`, "i");
+
+  return text
+    .split("\n")
+    .map((line) => {
+      const t = line.trim();
+      if (TAGS_RE.test(t)) {
+        return line.replace(/URI="([^"]+)"/gi, (_m, uri) => `URI="${toWorkerPath(uri, baseAbsUrl)}"`);
+      }
+      if (!t || t.startsWith("#")) return line;
+      return toWorkerPath(t, baseAbsUrl);
+    })
+    .join("\n");
+}
