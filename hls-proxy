@@ -56,8 +56,8 @@ else { v.src=src; }
 };
 
 function absOrigin(env) {
-  // غيّر هذا المتغير من إعدادات الـWorker إن رغبت: ORIGIN_BASE = http://46.152.116.98
-  return (env && env.ORIGIN_BASE) || "http://46.152.116.98";
+  // غيّر هذا المتغير من إعدادات الـWorker إن رغبت: ORIGIN_BASE = http://46.152.17.35
+  return (env && env.ORIGIN_BASE) || "http://46.152.17.35";
 }
 
 function corsHeaders() {
